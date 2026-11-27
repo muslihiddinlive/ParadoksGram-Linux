@@ -1,0 +1,236 @@
+name: ParadoksGram Linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'ParadoksGram-Windows branch, tag or commit to build'
+        default: dev
+      clean_build:
+        description: 'Ignore the compiler cache and compile everything'
+        type: boolean
+        default: false
+      publish:
+        description: 'Publish a release when the build succeeds'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  SOURCE_REPO: muslihiddinlive/ParadoksGram-Windows
+
+jobs:
+  linux:
+    name: ${{ matrix.stage == 'libs' && 'Libraries (Docker image cache)' || 'ParadoksGram build' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    # Stage 1 only builds and caches the Docker image with all libraries (Qt, ffmpeg, ...).
+    # Stage 2 restores it and compiles ParadoksGram. Two jobs, because one job cannot do
+    # both from a cold start within the 6 hour limit.
+    strategy:
+      fail-fast: true
+      max-parallel: 1
+      matrix:
+        stage: [libs, build]
+
+    env:
+      ONLY_CACHE: ${{ matrix.stage == 'libs' && 'true' || 'false' }}
+      IMAGE_TAG: tdesktop:centos_env
+
+    steps:
+      - name: Clone this repository.
+        uses: actions/checkout@v7
+        with:
+          path: self
+
+      - name: Clone the sources.
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ github.event.inputs.ref || 'dev' }}
+          submodules: recursive
+          path: src
+
+      - name: First set up.
+        working-directory: src
+        run: |
+          sudo apt update
+          curl -sSL https://install.python-poetry.org | python3 -
+          curl -sSL https://github.com/ccache/ccache/releases/download/v4.13.6/ccache-4.13.6-linux-x86_64-glibc.tar.xz \
+          | sudo tar xJ -C /usr/local/bin --strip-components=1 ccache-4.13.6-linux-x86_64-glibc/ccache
+          mkdir -p "$RUNNER_TEMP/.tdesktop-cache"
+          echo "CCACHE_DIR=$RUNNER_TEMP/.tdesktop-cache" >> $GITHUB_ENV
+          cd Telegram/build/docker/centos_env
+          poetry install
+          DOCKERFILE=$(DEBUG= LTO= poetry run gen_dockerfile)
+          echo "$DOCKERFILE" > Dockerfile
+          rm -rf __pycache__
+
+      - name: Free up some disk space.
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6
+        with:
+          tool-cache: true
+
+      - name: Set up Docker Buildx.
+        id: setup-buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Libraries cache.
+        id: cache-libs
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ runner.temp }}/.buildx-cache
+            ${{ runner.temp }}/.mount-cache
+          key: ${{ runner.OS }}-libs-${{ hashFiles('src/Telegram/build/docker/centos_env/**') }}
+          restore-keys: ${{ runner.OS }}-libs-
+
+      - name: Restore Docker cache mounts.
+        uses: reproducible-containers/buildkit-cache-dance@5422eac04292c961a382e0f584ea0f03ad9da723
+        with:
+          builder: ${{ steps.setup-buildx.outputs.name }}
+          cache-dir: ${{ runner.temp }}/.mount-cache
+          dockerfile: src/Telegram/build/docker/centos_env/Dockerfile
+          skip-extraction: ${{ steps.cache-libs.outputs.cache-hit }}
+
+      - name: Libraries.
+        uses: docker/build-push-action@v7
+        with:
+          context: src/Telegram/build/docker/centos_env
+          load: ${{ env.ONLY_CACHE == 'false' }}
+          tags: ${{ env.IMAGE_TAG }}
+          cache-from: type=local,src=${{ runner.temp }}/.buildx-cache
+          cache-to: type=local,dest=${{ runner.temp }}/.buildx-cache-new,mode=max
+
+      - name: Move cache.
+        run: |
+          rm -rf ${{ runner.temp }}/.buildx-cache
+          mv ${{ runner.temp }}/.buildx-cache{-new,}
+
+      - name: Restore the compiler cache.
+        id: cache-ccache
+        if: env.ONLY_CACHE == 'false' && github.event.inputs.clean_build != 'true'
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.OS }}-paradoks-ccache-${{ github.run_id }}
+          restore-keys: ${{ runner.OS }}-paradoks-ccache-
+
+      - name: Ads server address.
+        if: env.ONLY_CACHE == 'false'
+        working-directory: src
+        env:
+          ADS_SERVER_URL: ${{ vars.ADS_SERVER_URL || secrets.ADS_SERVER_URL }}
+        run: |
+          FILE="Telegram/SourceFiles/paradoks/paradoks_ads_server.h"
+          URL="$(printf '%s' "$ADS_SERVER_URL" | tr -d '\r\n"\\ ')"
+          if [ -n "$URL" ]; then
+            printf '#pragma once\n#define PARADOKS_AD_SERVER "%s"\n' "$URL" > "$FILE"
+            echo "Own ads server address is set."
+          else
+            echo "ADS_SERVER_URL is empty, own ads stay off."
+          fi
+
+      # KEEP_GOING=1 makes ninja report every failing file in one run, which
+      # matters for a first Linux build of code written for Windows.
+      - name: ParadoksGram build.
+        id: build
+        if: env.ONLY_CACHE == 'false'
+        working-directory: src
+        timeout-minutes: 320
+        env:
+          API_ID: ${{ secrets.TDESKTOP_API_ID }}
+          API_HASH: ${{ secrets.TDESKTOP_API_HASH }}
+        run: |
+          if [ -n "$API_ID" ] && [ -n "$API_HASH" ]; then
+            API_ARGS=(-D "TDESKTOP_API_ID=$API_ID" -D "TDESKTOP_API_HASH=$API_HASH")
+          else
+            echo "::warning::No TDESKTOP_API_ID / TDESKTOP_API_HASH secrets, using the limited TEST credentials."
+            API_ARGS=(-D TDESKTOP_API_TEST=ON)
+          fi
+
+          ccache -z
+
+          docker run --rm \
+            -u "$(id -u)" \
+            -v "$PWD:/usr/src/tdesktop" \
+            -v "$CCACHE_DIR:/var/cache/ccache" \
+            -e CONFIG=Release \
+            -e KEEP_GOING=1 \
+            -e CCACHE_SLOPPINESS=pch_defines,time_macros \
+            "$IMAGE_TAG" \
+            env -u CCACHE_DISABLE /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
+            -D CMAKE_CONFIGURATION_TYPES=Release \
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON \
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON \
+            -D "PARADOKS_BUILD_NUMBER=${{ github.run_number }}" \
+            "${API_ARGS[@]}" 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      # Saved also after a failed or timed out build: objects that compiled
+      # are valid, so the next run only builds what is missing.
+      - name: Save the compiler cache.
+        if: always() && env.ONLY_CACHE == 'false' && steps.build.outcome != 'skipped'
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.OS }}-paradoks-ccache-${{ github.run_id }}
+
+      - name: Report errors.
+        if: failure() && env.ONLY_CACHE == 'false'
+        run: |
+          set +e +o pipefail
+          log="$RUNNER_TEMP/build.log"
+          [ -f "$log" ] || exit 0
+          errs=$(grep -aE ' error: |CMake Error|FAILED: |undefined reference|fatal error' "$log" | sort -u | head -n 40 | sed 's/%/%25/g; s/\r//g' | awk '{printf "%s%%0A", $0}')
+          echo "::error title=build errors::$errs"
+          exit 0
+
+      - name: Upload the build log.
+        if: failure() && env.ONLY_CACHE == 'false'
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-log-${{ github.run_number }}
+          path: ${{ runner.temp }}/build.log
+          retention-days: 7
+
+      - name: Check the result.
+        if: env.ONLY_CACHE == 'false'
+        run: |
+          f=src/out/Release/Telegram
+          test -f "$f"
+          ls -l "$f"
+
+      - name: Package.
+        if: env.ONLY_CACHE == 'false'
+        run: |
+          mkdir -p pkg/ParadoksGram
+          cp src/out/Release/Telegram pkg/ParadoksGram/Telegram
+          strip -s pkg/ParadoksGram/Telegram || true
+          cp self/packaging/paradoksgram.desktop self/packaging/install.sh pkg/ParadoksGram/
+          chmod +x pkg/ParadoksGram/install.sh pkg/ParadoksGram/Telegram
+          icon=src/Telegram/Resources/art/icon256.png
+          if [ -f "$icon" ]; then cp "$icon" pkg/ParadoksGram/paradoksgram.png; else echo "No icon found"; fi
+          XZ_OPT='-9e -T0' tar -cJf ParadoksGram-Linux-x64.tar.xz -C pkg ParadoksGram
+          ls -l ParadoksGram-Linux-x64.tar.xz
+
+      - name: Publish the release.
+        if: env.ONLY_CACHE == 'false' && github.event.inputs.publish != 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ver=$(awk '/^AppVersionStr /{print $2}' src/Telegram/build/version)
+          commit=$(git -C src rev-parse --short HEAD)
+          gh release create "build-${{ github.run_number }}" ParadoksGram-Linux-x64.tar.xz \
+            --title "ParadoksGram Linux (build ${{ github.run_number }})" \
+            --notes "Linux x64. Telegram Desktop $ver asosida, manba: ParadoksGram-Windows@$commit. Arxivni oching va ./install.sh ni ishga tushiring." \
+            --prerelease

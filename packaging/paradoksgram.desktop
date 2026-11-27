@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Name=ParadoksGram
+Comment=Telegram client
+Exec=@EXEC@ -- %u
+Icon=paradoksgram
+Terminal=false
+Type=Application
+Categories=Chat;Network;InstantMessaging;Qt;
+MimeType=x-scheme-handler/tg;x-scheme-handler/tonsite;
+StartupNotify=true
